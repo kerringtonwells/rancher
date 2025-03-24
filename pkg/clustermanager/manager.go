@@ -153,22 +153,39 @@ func (m *Manager) start(ctx context.Context, cluster *apimgmtv3.Cluster, control
 
 func (m *Manager) startController(r *record, controllers, clusterOwner bool) error {
 	if !controllers {
+		logrus.Debugf("Skipping startController: controllers flag is false for cluster %s", r.cluster.ClusterName)
 		return nil
 	}
 
 	r.Lock()
 	defer r.Unlock()
-	if !r.started {
-		go func() {
-			if err := m.doStart(r, clusterOwner); err != nil {
-				logrus.Errorf("failed to start cluster controllers %s: %v", r.cluster.ClusterName, err)
-				m.markUnavailable(r.clusterRec.Name)
-				m.Stop(r.clusterRec)
-			}
-		}()
+
+	if r.started {
+		logrus.Warnf("startController called but cluster %s is already started", r.cluster.ClusterName)
+		return nil
+	}
+
+	logrus.Infof("Starting cluster controllers for %s [owner=%v]", r.cluster.ClusterName, clusterOwner)
+
+	go func() {
+		startTime := time.Now()
+		if err := m.doStart(r, clusterOwner); err != nil {
+			logrus.Errorf("Cluster %s startup failed after %s: %+v", r.cluster.ClusterName, time.Since(startTime), err)
+			
+			// Capture detailed cluster state before marking unavailable
+			logrus.Debugf("Cluster state: %+v", r.clusterRec.Status)
+			
+			// Mark cluster unavailable
+			m.markUnavailable(r.clusterRec.Name)
+			m.Stop(r.clusterRec)
+			return
+		}
+
 		r.started = true
 		r.owner = clusterOwner
-	}
+		logrus.Infof("Cluster %s controllers started successfully in %s", r.cluster.ClusterName, time.Since(startTime))
+	}()
+
 	return nil
 }
 
@@ -191,65 +208,73 @@ func (m *Manager) changed(r *record, cluster *apimgmtv3.Cluster, controllers, cl
 func (m *Manager) doStart(rec *record, clusterOwner bool) (exit error) {
 	defer func() {
 		if exit == nil {
-			logrus.Infof("Starting cluster agent for %s [owner=%v]", rec.cluster.ClusterName, clusterOwner)
+			logrus.Infof("Successfully started cluster agent for %s [owner=%v]", rec.cluster.ClusterName, clusterOwner)
+		} else {
+			logrus.Errorf("Cluster agent startup failed for %s: %+v", rec.cluster.ClusterName, exit)
 		}
 	}()
 
-	for i := 0; ; i++ {
-		// Prior to k8s v1.14, we simply did a DiscoveryClient.Version() check to see if the user cluster is alive
-		// As of k8s v1.14, kubeapi returns a successful version response even if etcd is not available.
-		// To work around this, now we try to get a namespace from the API, even if not found, it means the API is up.
-		if _, err := rec.cluster.K8sClient.CoreV1().Namespaces().Get(rec.ctx, "kube-system", metav1.GetOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			if i == 2 {
-				m.markUnavailable(rec.cluster.ClusterName)
-			}
-			select {
-			case <-rec.ctx.Done():
-				return rec.ctx.Err()
-			case <-time.After(5 * time.Second):
-				continue
-			}
-		}
+	logrus.Debugf("Checking if cluster %s API is accessible...", rec.cluster.ClusterName)
 
+	// Check cluster connectivity
+	for i := 0; i < 3; i++ {
+		if _, err := rec.cluster.K8sClient.CoreV1().Namespaces().Get(rec.ctx, "kube-system", metav1.GetOptions{}); err != nil {
+			if apierrors.IsNotFound(err) {
+				logrus.Debugf("Cluster %s API is reachable but kube-system namespace not found (attempt %d)", rec.cluster.ClusterName, i+1)
+			} else {
+				logrus.Warnf("Cluster %s API check failed (attempt %d): %v", rec.cluster.ClusterName, i+1, err)
+				if i == 2 {
+					m.markUnavailable(rec.cluster.ClusterName)
+				}
+			}
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		logrus.Debugf("Cluster %s API is accessible.", rec.cluster.ClusterName)
 		break
 	}
 
+	// Try to acquire semaphore
+	logrus.Debugf("Attempting to acquire start semaphore for cluster %s...", rec.cluster.ClusterName)
 	if err := m.startSem.Acquire(rec.ctx, 1); err != nil {
+		logrus.Errorf("Failed to acquire semaphore for cluster %s: %v", rec.cluster.ClusterName, err)
 		return err
 	}
 	defer m.startSem.Release(1)
 
+	logrus.Infof("Registering cluster controllers for %s...", rec.cluster.ClusterName)
+
 	transaction := controller.NewHandlerTransaction(rec.ctx)
 
-	// pre-bootstrap the cluster if it's not already bootstrapped
-	apimgmtv3.ClusterConditionPreBootstrapped.CreateUnknownIfNotExists(rec.clusterRec)
 	if capr.PreBootstrap(rec.clusterRec) {
-		err := clusterController.PreBootstrap(transaction, m.ScaledContext, rec.cluster, rec.clusterRec, m)
-		if err != nil {
+		logrus.Debugf("Pre-bootstrap required for cluster %s", rec.cluster.ClusterName)
+		if err := clusterController.PreBootstrap(transaction, m.ScaledContext, rec.cluster, rec.clusterRec, m); err != nil {
+			logrus.Errorf("Pre-bootstrap failed for cluster %s: %v", rec.cluster.ClusterName, err)
 			transaction.Rollback()
 			return err
 		}
 	}
 
 	if clusterOwner {
+		logrus.Debugf("Registering cluster %s as owner", rec.cluster.ClusterName)
 		if err := clusterController.Register(transaction, m.ScaledContext, rec.cluster, rec.clusterRec, m); err != nil {
+			logrus.Errorf("Cluster registration failed for %s: %v", rec.cluster.ClusterName, err)
 			transaction.Rollback()
 			return err
 		}
 	} else {
+		logrus.Debugf("Registering cluster %s as follower", rec.cluster.ClusterName)
 		if err := clusterController.RegisterFollower(rec.cluster); err != nil {
+			logrus.Errorf("Follower registration failed for cluster %s: %v", rec.cluster.ClusterName, err)
 			transaction.Rollback()
 			return err
 		}
 	}
 
+	logrus.Infof("Starting controllers for cluster %s...", rec.cluster.ClusterName)
 	done := make(chan error, 1)
 	go func() {
 		defer close(done)
-
-		logrus.Debugf("[clustermanager] creating AccessControl for cluster %v", rec.cluster.ClusterName)
-		rec.accessControl = rbac.NewAccessControl(transaction, rec.cluster.ClusterName, rec.cluster.RBACw)
-
 		err := rec.cluster.Start(rec.ctx)
 		if err == nil {
 			transaction.Commit()
@@ -262,8 +287,12 @@ func (m *Manager) doStart(rec *record, clusterOwner bool) (exit error) {
 	select {
 	case <-time.After(10 * time.Minute):
 		rec.cancel()
+		logrus.Errorf("Timeout waiting for cluster %s controllers to start", rec.cluster.ClusterName)
 		return fmt.Errorf("timeout syncing controllers")
 	case err := <-done:
+		if err != nil {
+			logrus.Errorf("Cluster controllers failed to start for %s: %v", rec.cluster.ClusterName, err)
+		}
 		return err
 	}
 }
