@@ -14,6 +14,9 @@ RUN zypper refresh && \
     zypper --installroot /chroot clean -a && \
     rm -rf /chroot/var/cache/zypp/* /chroot/var/log/zypp/* /chroot/tmp/* /chroot/var/tmp/* /chroot/usr/share/doc/packages/*
 
+# Add k3s as a stage to ensure the image is available
+FROM rancher/k3s:v1.27.12-k3s1 AS k3s
+
 # Main stage using bci-micro as the base image
 FROM final AS base
 
@@ -59,7 +62,10 @@ ENV CATTLE_PARTNER_CHART_DEFAULT_BRANCH=$PARTNER_CHART_DEFAULT_BRANCH
 ENV CATTLE_RKE2_CHART_DEFAULT_BRANCH=$RKE2_CHART_DEFAULT_BRANCH
 ENV CATTLE_HELM_VERSION v2.16.8-rancher2
 ENV CATTLE_MACHINE_VERSION v0.15.0-rancher124
-ENV CATTLE_K3S_VERSION v1.31.1+k3s1
+#ENV CATTLE_K3S_VERSION 1.27.12+k3s1  # Format expected by export-images
+ARG CATTLE_K3S_VERSION
+ENV CATTLE_K3S_VERSION=${CATTLE_K3S_VERSION}
+ENV CATTLE_K3S_FULL_VERSION v1.27.12-k3s1  # Full tag for the k3s image
 ENV CATTLE_MACHINE_PROVISION_IMAGE rancher/machine:${CATTLE_MACHINE_VERSION}
 ENV CATTLE_ETCD_VERSION v3.5.14
 ENV TINI_VERSION v0.18.0
@@ -81,7 +87,7 @@ ENV CATTLE_SYSTEM_AGENT_VERSION v0.3.11
 ENV CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX https://github.com/rancher/system-agent/releases/download
 ENV CATTLE_SYSTEM_AGENT_UPGRADE_IMAGE rancher/system-agent:${CATTLE_SYSTEM_AGENT_VERSION}-suc
 ENV CATTLE_SYSTEM_AGENT_INSTALLER_IMAGE rancher/system-agent-installer-
-# make sure the ENV CATTLE_SYSTEM_AGENT_INSTALL_SCRIPT is consistent with pkg/settings/setting.go to utlize the local version of install script downloaded during build/package
+# make sure the ENV CATTLE_SYSTEM_AGENT_INSTALL_SCRIPT is consistent with pkg/settings/setting.go to utilize the local version of install script downloaded during build/package
 ENV CATTLE_SYSTEM_AGENT_INSTALL_SCRIPT ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/install.sh
 ENV CATTLE_SYSTEM_AGENT_UNINSTALL_SCRIPT ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/system-agent-uninstall.sh
 ENV CATTLE_SYSTEM_UPGRADE_CONTROLLER_CHART_VERSION 105.0.1
@@ -169,7 +175,7 @@ RUN curl ${HELM_URL_V3} | tar xvzf - --strip-components=1 -C /usr/bin && \
     chmod +x /usr/bin/helm_v3
 
 # Set up K3s: copy the necessary binaries from the K3s image.
-COPY --from=rancher/k3s:v1.31.1-k3s1 \
+COPY --from=k3s \
     /bin/blkid \
     /bin/bandwidth \
     /bin/cni \
@@ -235,27 +241,34 @@ ENV AUDIT_LEVEL 0
 
 RUN mkdir -p /usr/share/rancher/ui && \
     cd /usr/share/rancher/ui && \
-    curl -sL https://releases.rancher.com/ui/${CATTLE_UI_VERSION}.tar.gz | tar xvzf - --strip-components=1 && \
+    curl -sL https://releases.rancher.com/ui/${CATTLE_UI_VERSION}.tar.gz | tar xvzf - --strip-components=1
+
+RUN cd /usr/share/rancher/ui && \
     mkdir -p assets/rancher-ui-driver-linode && \
     cd assets/rancher-ui-driver-linode && \
     curl -O https://linode.github.io/rancher-ui-driver-linode/releases/${LINODE_UI_DRIVER_VERSION}/component.js && \
     curl -O https://linode.github.io/rancher-ui-driver-linode/releases/${LINODE_UI_DRIVER_VERSION}/component.css && \
-    curl -O https://linode.github.io/rancher-ui-driver-linode/releases/${LINODE_UI_DRIVER_VERSION}/linode.svg && \
-    mkdir -p /usr/share/rancher/ui/api-ui && \
+    curl -O https://linode.github.io/rancher-ui-driver-linode/releases/${LINODE_UI_DRIVER_VERSION}/linode.svg
+
+RUN mkdir -p /usr/share/rancher/ui/api-ui && \
     cd /usr/share/rancher/ui/api-ui && \
-    curl -sL https://releases.rancher.com/api-ui/${CATTLE_API_UI_VERSION}.tar.gz | tar xvzf - --strip-components=1 && \
-    mkdir -p /usr/share/rancher/ui-dashboard/dashboard && \
+    curl -sL https://releases.rancher.com/api-ui/${CATTLE_API_UI_VERSION}.tar.gz | tar xvzf - --strip-components=1
+
+RUN mkdir -p /usr/share/rancher/ui-dashboard/dashboard && \
     cd /usr/share/rancher/ui-dashboard/dashboard && \
     curl -sL https://releases.rancher.com/dashboard/${CATTLE_DASHBOARD_UI_VERSION}.tar.gz | tar xvzf - --strip-components=2 && \
-    ln -s dashboard/index.html ../index.html && \
-    cd ../../ui/assets && \
+    ln -s dashboard/index.html ../index.html
+
+RUN cd /usr/share/rancher/ui/assets && \
     curl -sfL ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/rancher-system-agent-arm64 -O && \
     curl -sfL ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/rancher-system-agent-amd64 -O && \
     curl -sfL ${CATTLE_SYSTEM_AGENT_INSTALL_SCRIPT} -o system-agent-install.sh && \
-    curl -sfL ${CATTLE_SYSTEM_AGENT_UNINSTALL_SCRIPT} -o system-agent-uninstall.sh && \
+    curl -sfL ${CATTLE_SYSTEM_AGENT_UNINSTALL_SCRIPT} -o system-agent-uninstall.sh
+
+RUN cd /usr/share/rancher/ui/assets && \
     curl -sfL https://github.com/rancher/wins/releases/download/${CATTLE_WINS_AGENT_VERSION}/wins.exe -O && \
     curl -sfL https://acs-mirror.azureedge.net/csi-proxy/${CATTLE_CSI_PROXY_AGENT_VERSION}/binaries/csi-proxy-${CATTLE_CSI_PROXY_AGENT_VERSION}.tar.gz -O && \
-    curl -sfL ${CATTLE_WINS_AGENT_INSTALL_SCRIPT} -o wins-agent-install.ps1 \
+    curl -sfL ${CATTLE_WINS_AGENT_INSTALL_SCRIPT} -o wins-agent-install.ps1 && \
     curl -sfL ${CATTLE_WINS_AGENT_UNINSTALL_SCRIPT} -o wins-agent-uninstall.ps1
 
 ENV CATTLE_CLI_URL_DARWIN  https://releases.rancher.com/cli2/${CATTLE_CLI_VERSION}/rancher-darwin-amd64-${CATTLE_CLI_VERSION}.tar.gz
@@ -269,11 +282,12 @@ ENV ETCDCTL_API=3
 ENV SSL_CERT_DIR /etc/rancher/ssl
 ENV ETCD_UNSUPPORTED_ARCH ${ETCD_UNSUPPORTED_ARCH}
 
-
 # Enable exporting of the k3s images as part of the build process.
 FROM --platform=$BUILDPLATFORM registry.suse.com/bci/golang:1.22 AS images
 
-ENV CATTLE_K3S_VERSION v1.31.1+k3s1
+ARG CATTLE_K3S_VERSION
+ENV CATTLE_K3S_VERSION=${CATTLE_K3S_VERSION}
+#ENV CATTLE_K3S_VERSION 1.27.12+k3s1  # Format expected by export-images
 
 RUN zypper -n install libbtrfs-devel libgpgme-devel
 
@@ -283,7 +297,6 @@ RUN go mod download
 
 RUN go build -tags k3s_export -o export-images ./...
 RUN ./export-images -k3s-version ${CATTLE_K3S_VERSION} -output /src/k3s-airgap-images.tar
-
 
 FROM --platform=$BUILDPLATFORM registry.suse.com/bci/golang:1.22 AS build
 ARG VERSION
